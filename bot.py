@@ -1,8 +1,9 @@
 import os
+import asyncio
 import logging
 from dotenv import load_dotenv
 from googletrans import Translator
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,10 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global translator (async context manager)
+# Single shared translator instance (googletrans v4 is synchronous)
 translator = Translator()
 
-# User preferred languages (in-memory; replace with DB for production)
+# User preferred languages (in-memory; swap for a DB in production)
 user_prefs = {}
 
 # Common languages for quick selection
@@ -53,6 +54,20 @@ LANGUAGES = {
 }
 
 
+# ---------- Helper wrappers (run blocking calls in a thread) ----------
+
+def _sync_translate(text: str, dest: str):
+    """Blocking translate call — runs inside asyncio.to_thread."""
+    return translator.translate(text, dest=dest)
+
+
+def _sync_detect(text: str):
+    """Blocking detect call — runs inside asyncio.to_thread."""
+    return translator.detect(text)
+
+
+# ---------- Command handlers ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message with usage instructions."""
     welcome_text = (
@@ -69,12 +84,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a help message."""
     await start(update, context)
 
 
 async def langs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List supported languages."""
     lang_list = "\n".join([f"`{code}` — {name}" for code, name in LANGUAGES.items()])
     await update.message.reply_text(
         f"*Supported Languages:*\n\n{lang_list}\n\n"
@@ -84,9 +97,8 @@ async def langs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def setlang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set user's preferred target language."""
     args = context.args
-    if not args or len(args) < 1:
+    if not args:
         await update.message.reply_text(
             "Usage: `/setlang <language_code>`\nExample: `/setlang es`",
             parse_mode="Markdown",
@@ -102,8 +114,7 @@ async def setlang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    user_id = update.effective_user.id
-    user_prefs[user_id] = lang_code
+    user_prefs[update.effective_user.id] = lang_code
     await update.message.reply_text(
         f"✅ Preferred language set to: *{LANGUAGES[lang_code]}* (`{lang_code}`)",
         parse_mode="Markdown",
@@ -111,7 +122,6 @@ async def setlang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Translate text to a specified language: /tr <lang> <text>"""
     args = context.args
     if not args or len(args) < 2:
         await update.message.reply_text(
@@ -122,12 +132,10 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     target_lang = args[0].lower()
     text_to_translate = " ".join(args[1:])
-
     await _perform_translation(update, text_to_translate, dest=target_lang)
 
 
 async def detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Detect the language of provided text: /detect <text>"""
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -136,8 +144,7 @@ async def detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    text = " ".join(args)
-    await _perform_detection(update, text)
+    await _perform_detection(update, " ".join(args))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,48 +156,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text or text.startswith("/"):
         return
 
-    user_id = update.effective_user.id
-    target_lang = user_prefs.get(user_id, "en")
-
+    target_lang = user_prefs.get(update.effective_user.id, "en")
     await _perform_translation(update, text, dest=target_lang)
 
 
+# ---------- Core logic ----------
+
 async def _perform_translation(update: Update, text: str, dest: str = "en") -> None:
-    """Core translation logic with pronunciation and alternatives."""
+    """Translate text and reply with detected language + translation."""
     try:
-        async with Translator() as t:
-            result = await t.translate(text, dest=dest)
+        # Run the blocking googletrans call in a worker thread
+        result = await asyncio.to_thread(_sync_translate, text, dest)
 
-        detected = result.src
-        translated = result.text
-        pronunciation = getattr(result, "pronunciation", None)
-
-        # Build response
         response_parts = [
-            f"🔍 *Detected:* `{detected}`",
+            f"🔍 *Detected:* `{result.src}`",
             f"🌐 *Translated ({dest}):*",
-            f"`{translated}`",
+            f"`{result.text}`",
         ]
 
-        if pronunciation and pronunciation != translated:
+        # googletrans v4 doesn't expose pronunciation — skip if missing
+        pronunciation = getattr(result, "pronunciation", None)
+        if pronunciation and pronunciation != result.text:
             response_parts.append(f"🔊 *Pronunciation:* `{pronunciation}`")
 
-        response = "\n".join(response_parts)
-        await update.message.reply_text(response, parse_mode="Markdown")
+        await update.message.reply_text("\n".join(response_parts), parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Translation error: {e}")
+        logger.error(f"Translation error: {e}", exc_info=True)
         await update.message.reply_text(
             "❌ Translation failed. Please try again later or check the language code."
         )
 
 
 async def _perform_detection(update: Update, text: str) -> None:
-    """Detect language with confidence score."""
+    """Detect the language of a text."""
     try:
-        async with Translator() as t:
-            result = await t.detect(text)
-
+        result = await asyncio.to_thread(_sync_detect, text)
         lang_name = LANGUAGES.get(result.lang, result.lang)
         confidence = f"{result.confidence:.2%}" if result.confidence else "N/A"
 
@@ -203,33 +204,29 @@ async def _perform_detection(update: Update, text: str) -> None:
         await update.message.reply_text(response, parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Detection error: {e}")
+        logger.error(f"Detection error: {e}", exc_info=True)
         await update.message.reply_text("❌ Language detection failed. Please try again.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors caused by updates."""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
+# ---------- Entry point ----------
+
 def main() -> None:
-    """Start the bot using polling mode."""
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("langs", langs_command))
     application.add_handler(CommandHandler("setlang", setlang_command))
     application.add_handler(CommandHandler("tr", translate_command))
     application.add_handler(CommandHandler("detect", detect_command))
-
-    # Message handler for plain text auto-translation
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    # Error handler
     application.add_error_handler(error_handler)
 
     logger.info("Bot started — polling for updates...")
