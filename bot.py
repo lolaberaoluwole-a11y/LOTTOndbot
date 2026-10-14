@@ -12,28 +12,27 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Load environment variables
+# ---------- Configuration ----------
 load_dotenv()
 
-# Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
 
-# Logging setup
+# ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Single shared translator instance (googletrans v4 is synchronous)
+# ---------- Globals ----------
+# googletrans v4.x is synchronous — one shared instance is fine.
 translator = Translator()
 
-# User preferred languages (in-memory; swap for a DB in production)
-user_prefs = {}
+# In-memory user preferences. Swap for Redis/Postgres in production.
+user_prefs: dict[int, str] = {}
 
-# Common languages for quick selection
 LANGUAGES = {
     "en": "English",
     "es": "Spanish",
@@ -54,23 +53,18 @@ LANGUAGES = {
 }
 
 
-# ---------- Helper wrappers (run blocking calls in a thread) ----------
-
+# ---------- Blocking helpers (run inside asyncio.to_thread) ----------
 def _sync_translate(text: str, dest: str):
-    """Blocking translate call — runs inside asyncio.to_thread."""
     return translator.translate(text, dest=dest)
 
 
 def _sync_detect(text: str):
-    """Blocking detect call — runs inside asyncio.to_thread."""
     return translator.detect(text)
 
 
 # ---------- Command handlers ----------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a welcome message with usage instructions."""
-    welcome_text = (
+    text = (
         "🌍 *Welcome to LOTTOndbot — Your Language Helper!*\n\n"
         "Here's what I can do:\n\n"
         "• *Translate any text* — just send it to me\n"
@@ -80,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/langs` — list supported languages\n\n"
         "Example: `/tr fr Hello, how are you?`"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -88,7 +82,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def langs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    lang_list = "\n".join([f"`{code}` — {name}" for code, name in LANGUAGES.items()])
+    lang_list = "\n".join(f"`{code}` — {name}" for code, name in LANGUAGES.items())
     await update.message.reply_text(
         f"*Supported Languages:*\n\n{lang_list}\n\n"
         "Use `/setlang <code>` to save your preference.",
@@ -148,7 +142,7 @@ async def detect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-translate plain text messages to user's preferred language."""
+    """Auto-translate plain text to the user's preferred language."""
     if not update.message or not update.message.text:
         return
 
@@ -160,60 +154,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _perform_translation(update, text, dest=target_lang)
 
 
-# ---------- Core logic ----------
-
+# ---------- Core translation / detection ----------
 async def _perform_translation(update: Update, text: str, dest: str = "en") -> None:
-    """Translate text and reply with detected language + translation."""
     try:
-        # Run the blocking googletrans call in a worker thread
+        # Run the blocking googletrans call off the event loop.
         result = await asyncio.to_thread(_sync_translate, text, dest)
 
-        response_parts = [
+        parts = [
             f"🔍 *Detected:* `{result.src}`",
             f"🌐 *Translated ({dest}):*",
             f"`{result.text}`",
         ]
 
-        # googletrans v4 doesn't expose pronunciation — skip if missing
         pronunciation = getattr(result, "pronunciation", None)
         if pronunciation and pronunciation != result.text:
-            response_parts.append(f"🔊 *Pronunciation:* `{pronunciation}`")
+            parts.append(f"🔊 *Pronunciation:* `{pronunciation}`")
 
-        await update.message.reply_text("\n".join(response_parts), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Translation error: {e}", exc_info=True)
+        logger.error("Translation error: %s", e, exc_info=True)
         await update.message.reply_text(
             "❌ Translation failed. Please try again later or check the language code."
         )
 
 
 async def _perform_detection(update: Update, text: str) -> None:
-    """Detect the language of a text."""
     try:
         result = await asyncio.to_thread(_sync_detect, text)
         lang_name = LANGUAGES.get(result.lang, result.lang)
         confidence = f"{result.confidence:.2%}" if result.confidence else "N/A"
 
-        response = (
+        await update.message.reply_text(
             f"🔍 *Language Detected:*\n"
             f"• Code: `{result.lang}`\n"
             f"• Name: *{lang_name}*\n"
-            f"• Confidence: `{confidence}`"
+            f"• Confidence: `{confidence}`",
+            parse_mode="Markdown",
         )
-        await update.message.reply_text(response, parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Detection error: {e}", exc_info=True)
-        await update.message.reply_text("❌ Language detection failed. Please try again.")
+        logger.error("Detection error: %s", e, exc_info=True)
+        await update.message.reply_text(
+            "❌ Language detection failed. Please try again."
+        )
 
 
+# ---------- Error handler ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
 # ---------- Entry point ----------
-
 def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -223,6 +215,7 @@ def main() -> None:
     application.add_handler(CommandHandler("setlang", setlang_command))
     application.add_handler(CommandHandler("tr", translate_command))
     application.add_handler(CommandHandler("detect", detect_command))
+
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
